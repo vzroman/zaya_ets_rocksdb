@@ -93,7 +93,7 @@ write(#ref{ets = EtsRef, rocksdb = RocksdbRef}, KVs)->
   zaya_ets:write( EtsRef, KVs ).
 
 delete(#ref{ets = EtsRef, rocksdb = RocksdbRef}, Keys)->
-  zaya_rocksdb:delete( rocksdbRef, Keys ),
+  zaya_rocksdb:delete( RocksdbRef, Keys ),
   zaya_ets:delete( EtsRef, Keys ).
 
 %%=================================================================
