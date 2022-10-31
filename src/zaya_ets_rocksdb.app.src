@@ -4,13 +4,14 @@
   {registered, []},
   {applications,
    [kernel,
-    stdlib
+    stdlib,
+    zaya_ets,
+    zaya_rocksdb
    ]},
   {env,[]},
   {modules, []},
   {included_applications,[
-    zaya_ets,
-    zaya_rocksdb
+
   ]},
   {licenses, ["MIT"]},
   {links, []}
