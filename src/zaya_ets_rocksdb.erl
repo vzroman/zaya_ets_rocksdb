@@ -79,8 +79,8 @@ close( #ref{ets = EtsRef, rocksdb = RocksdbRef} )->
   catch zaya_ets:close( EtsRef ),
   zaya_rocksdb:close( RocksdbRef ).
 
-remove( #{rocksdb := Params} )->
-  zaya_rocksdb:remove( Params ).
+remove( Params )->
+  zaya_rocksdb:remove( type_params(rocksdb, Params) ).
 
 %%=================================================================
 %%	LOW_LEVEL
