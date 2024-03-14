@@ -162,9 +162,9 @@ commit(#ref{ ets = EtsRef, rocksdb = RocksdbRef }, Write, Delete)->
   ok.
 
 commit1(#ref{ ets = EtsRef, rocksdb = RocksdbRef }, Write, Delete)->
-  zaya_rocksdb:commit1( RocksdbRef, Write, Delete ),
-  zaya_ets:commit1( EtsRef, Write, Delete ),
-  ok.
+  RocksdbTRef = zaya_rocksdb:commit1( RocksdbRef, Write, Delete ),
+  EtsTRef = zaya_ets:commit1( EtsRef, Write, Delete ),
+  {EtsTRef, RocksdbTRef}.
 
 commit2(#ref{ ets = EtsRef, rocksdb = RocksdbRef }, {EtsTRef, RocksdbTRef})->
   zaya_rocksdb:commit2( RocksdbRef, RocksdbTRef ),
