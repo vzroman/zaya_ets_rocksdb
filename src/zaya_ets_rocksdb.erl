@@ -51,6 +51,7 @@
 %%	TRANSACTION API
 %%=================================================================
 -export([
+  commit/3,
   commit1/3,
   commit2/2,
   rollback/2
@@ -155,6 +156,11 @@ dump_batch(Ref, KVs)->
 %%=================================================================
 %%	TRANSACTION API
 %%=================================================================
+commit(#ref{ ets = EtsRef, rocksdb = RocksdbRef }, Write, Delete)->
+  zaya_rocksdb:commit( RocksdbRef, Write, Delete ),
+  zaya_ets:commit( EtsRef, Write, Delete ),
+  ok.
+
 commit1(#ref{ ets = EtsRef, rocksdb = RocksdbRef }, Write, Delete)->
   zaya_rocksdb:commit1( RocksdbRef, Write, Delete ),
   zaya_ets:commit1( EtsRef, Write, Delete ),
