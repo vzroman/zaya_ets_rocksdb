@@ -6,7 +6,8 @@
    [kernel,
     stdlib,
     zaya_ets,
-    zaya_rocksdb
+    zaya_rocksdb,
+    zaya_pool
    ]},
   {env,[]},
   {modules, []},
