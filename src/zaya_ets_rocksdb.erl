@@ -97,9 +97,8 @@
 %%=================================================================
 -export([
   commit/3,
-  commit1/3,
-  commit2/2,
-  rollback/2
+  prepare_rollback/3,
+  is_persistent/0
 ]).
 
 %%=================================================================
@@ -119,9 +118,6 @@
 -record(ref, {
   ets,
   rocksdb,
-  log,
-  read,
-  write,
   pool
 }).
 
@@ -134,10 +130,6 @@ create(Params)->
   case pipe(#ref{}, [
     fun(Ref)-> Ref#ref{ets = zaya_ets:create(type_params(ets, Params))} end,
     fun(Ref)-> Ref#ref{rocksdb = zaya_rocksdb:create(type_params(rocksdb, Params))} end,
-    fun(Ref)->
-      {Log, ReadParams, WriteParams} = create_log(Params),
-      Ref#ref{log = Log, read = ReadParams, write = WriteParams}
-    end,
     fun(#ref{ets = EtsRef, rocksdb = RocksdbRef} = Ref)->
       Ref#ref{pool = open_pool(EtsRef, RocksdbRef, Params)}
     end
@@ -153,11 +145,6 @@ open(Params)->
   case pipe(#ref{}, [
     fun(Ref)-> Ref#ref{rocksdb = zaya_rocksdb:open(type_params(rocksdb, Params))} end,
     fun(Ref)-> Ref#ref{ets = zaya_ets:open(type_params(ets, Params))} end,
-    fun(#ref{rocksdb = RocksdbRef} = Ref)->
-      {Log, ReadParams, WriteParams} = open_log(Params),
-      rollback_log(Log, ReadParams, WriteParams, RocksdbRef),
-      Ref#ref{log = Log, read = ReadParams, write = WriteParams}
-    end,
     fun(#ref{ets = EtsRef, rocksdb = RocksdbRef} = Ref)->
       Ref#ref{pool = open_pool(EtsRef, RocksdbRef, Params)}
     end,
@@ -175,18 +162,15 @@ open(Params)->
 close(#ref{
   ets = EtsRef,
   rocksdb = RocksdbRef,
-  log = Log,
   pool = Pool
 })->
   catch close_pool(Pool),
   catch zaya_ets:close(EtsRef),
   catch zaya_rocksdb:close(RocksdbRef),
-  catch rocksdb:close(Log),
   ok.
 
 remove(Params)->
   zaya_rocksdb:remove(type_params(rocksdb, Params)),
-  catch remove_log(Params),
   ok.
 
 %%=================================================================
@@ -254,38 +238,11 @@ commit(#ref{ets = EtsRef, rocksdb = RocksdbRef, pool = disabled}, Write, Delete)
 commit(#ref{pool = Pool}, Write, Delete)->
   zaya_pool:call(Pool, [{write, Write}, {delete, Delete}]).
 
-commit1(#ref{ets = EtsRef, log = Log, write = WriteParams} = Ref, Write, Delete)->
-  {WriteBack, DeleteBack} = prepare_rollback(EtsRef, Write, Delete),
-  case WriteBack =:= [] andalso DeleteBack =:= [] of
-    true -> ignore;
-    false ->
-      TRef = term_to_binary(make_ref()),
-      try
-        ok = rocksdb:write(Log, [{put, TRef, term_to_binary({WriteBack, DeleteBack})}], WriteParams),
-        commit(Ref, Write, Delete),
-        TRef
-      catch
-        _:E ->
-          rollback(Ref, TRef),
-          throw(E)
-      end
-  end.
+prepare_rollback(#ref{ets = EtsRef}, Write, Delete)->
+  prepare_rollback_from_read(fun(Keys)-> zaya_ets:read(EtsRef, Keys) end, Write, Delete).
 
-commit2(#ref{log = Log, write = WriteParams}, TRef)->
-  case TRef of
-    ignore -> ok;
-    _ -> ok = rocksdb:write(Log, [{delete, TRef}], WriteParams)
-  end.
-
-rollback(#ref{log = Log, read = ReadParams, write = WriteParams} = Ref, TRef)->
-  case rocksdb:get(Log, TRef, ReadParams) of
-    {ok, Value} ->
-      {WriteBack, DeleteBack} = binary_to_term(Value),
-      commit(Ref, WriteBack, DeleteBack),
-      ok = rocksdb:write(Log, [{delete, TRef}], WriteParams);
-    _ ->
-      ok
-  end.
+is_persistent()->
+  true.
 
 %%=================================================================
 %%	POOL API
@@ -314,54 +271,6 @@ get_size(#ref{ets = EtsRef})->
   zaya_ets:get_size(EtsRef).
 
 %%=================================================================
-%%	LOG
-%%=================================================================
-create_log(Params)->
-  Options = ?OPTIONS(maps_merge(Params, #{rocksdb => #{open_options => #{create_if_missing => true}}})),
-  open_log_db(Options, create).
-
-open_log(Params)->
-  Options = ?OPTIONS(Params),
-  #{dir := Dir} = Options,
-  LogDir = Dir ++ "/TLOG",
-  case filelib:is_dir(LogDir) of
-    true -> ok;
-    false ->
-      ?LOGERROR("~s doesn't exist", [LogDir]),
-      throw(not_exists)
-  end,
-  open_log_db(Options, open).
-
-open_log_db(#{
-  dir := Dir,
-  rocksdb := #{
-    read := Read,
-    write := Write
-  }
-} = Options, Mode)->
-  LogDir = Dir ++ "/TLOG",
-  case Mode of
-    create -> ensure_dir(LogDir);
-    open -> ok
-  end,
-  Log = try_open(LogDir, Options),
-  {Log, maps:to_list(Read), maps:to_list(Write)}.
-
-remove_log(Params)->
-  Dir = maps:get(dir, Params, "."),
-  LogDir = Dir ++ "/TLOG",
-  remove_recursive(LogDir).
-
-rollback_log(Log, ReadParams, WriteParams, RocksdbRef)->
-  Entries = rocksdb:fold(Log, fun({TRef, Value}, Acc)->
-    [{TRef, binary_to_term(Value)} | Acc]
-  end, [], ReadParams),
-  lists:foreach(fun({TRef, {WriteBack, DeleteBack}})->
-    zaya_rocksdb:commit(RocksdbRef, WriteBack, DeleteBack),
-    rocksdb:write(Log, [{delete, TRef}], WriteParams)
-  end, Entries).
-
-%%=================================================================
 %%	DATA LOADING
 %%=================================================================
 load_data(RocksdbRef, EtsRef)->
@@ -383,17 +292,24 @@ load_data(RocksdbRef, EtsRef)->
 %%=================================================================
 %%	ROLLBACK PREPARATION
 %%=================================================================
-prepare_rollback(EtsRef, Write, Delete)->
-  WriteKeys = [K || {K, _} <- Write],
-  DeleteKeys = Delete,
-  CurrentForWrites = zaya_ets:read(EtsRef, WriteKeys),
-  CurrentForDeletes = zaya_ets:read(EtsRef, DeleteKeys),
-  WriteMap = maps:from_list(CurrentForWrites),
-  WriteBack =
-    [{K, V} || {K, V} <- CurrentForWrites, maps:get(K, maps:from_list(Write), undefined) =/= V] ++
-    CurrentForDeletes,
-  DeleteBack = [K || {K, _} <- Write, not maps:is_key(K, WriteMap)],
-  {WriteBack, DeleteBack}.
+prepare_rollback_from_read(ReadFun, Write, Delete)->
+  WriteMap = maps:from_list(Write),
+  WriteKeys = maps:keys(WriteMap),
+  CurrentForWrites = maps:from_list(ReadFun(WriteKeys)),
+  CurrentForDeletes = maps:from_list(ReadFun(Delete)),
+  RestoreWrites =
+    maps:fold(
+      fun(Key, Existing, Acc)->
+        case maps:get(Key, WriteMap) of
+          Existing -> Acc;
+          _ -> Acc#{Key => Existing}
+        end
+      end,
+      CurrentForDeletes,
+      CurrentForWrites
+    ),
+  DeleteBack = [Key || Key <- WriteKeys, not maps:is_key(Key, CurrentForWrites)],
+  {maps:to_list(RestoreWrites), DeleteBack}.
 
 %%=================================================================
 %%	POOL UTILITIES
@@ -437,81 +353,3 @@ type_params(Type, Params)->
   TypeParams = maps:with([Type], Params),
   OtherParams = maps:without([ets, rocksdb, pool], Params),
   maps:merge(OtherParams#{pool => disabled}, TypeParams).
-
-try_open(Dir, #{
-  rocksdb := #{
-    open_options := Params
-  },
-  open_attempts := Attempts
-} = Options) when Attempts > 0->
-  ?LOGINFO("~s try open with params ~p", [Dir, Params]),
-  case rocksdb:open(Dir, maps:to_list(Params)) of
-    {ok, Ref} -> Ref;
-    {error, {db_open, Error}} ->
-      case lists:prefix("IO error: lock ", Error) of
-        true ->
-          ?LOGWARNING("~s unable to open, hanging lock, trying to unlock", [Dir]),
-          case file:delete(?LOCK(Dir)) of
-            ok ->
-              ?LOGINFO("~s lock removed, trying open", [Dir]),
-              timer:sleep(?RETRY_TIMEOUT),
-              try_open(Dir, Options);
-            {error, UnlockError} ->
-              ?LOGERROR("~s lock remove error ~p, try to remove it manually", [?LOCK(Dir), UnlockError]),
-              throw(locked)
-          end;
-        false ->
-          ?LOGWARNING("~s open error ~p, try to repair left attempts ~p", [Dir, Error, Attempts - 1]),
-          try rocksdb:repair(Dir, [])
-          catch
-            _:E:S ->
-              ?LOGWARNING("~s repair attempt failed error ~p stack ~p, left attempts ~p", [Dir, E, S, Attempts - 1])
-          end,
-          timer:sleep(?RETRY_TIMEOUT),
-          try_open(Dir, Options#{open_attempts => Attempts - 1})
-      end;
-    {error, Other} ->
-      ?LOGERROR("~s open error ~p, left attempts ~p", [Dir, Other, Attempts - 1]),
-      timer:sleep(?RETRY_TIMEOUT),
-      try_open(Dir, Options#{open_attempts => Attempts - 1})
-  end;
-try_open(Dir, #{rocksdb := Params})->
-  ?LOGERROR("~s OPEN ERROR: params ~p", [Dir, Params]),
-  throw(open_error).
-
-ensure_dir(Path)->
-  case filelib:is_file(Path) of
-    false ->
-      case filelib:ensure_dir(Path ++ "/") of
-        ok -> ok;
-        {error, CreateError} ->
-          ?LOGERROR("~s create error ~p", [Path, CreateError]),
-          throw({create_dir_error, CreateError})
-      end;
-    true ->
-      remove_recursive(Path),
-      ensure_dir(Path)
-  end.
-
-remove_recursive(Path)->
-  case filelib:is_dir(Path) of
-    false ->
-      case filelib:is_file(Path) of
-        true -> file:delete(Path);
-        _ -> ok
-      end;
-    true ->
-      {ok, Files} = file:list_dir(Path),
-      [remove_recursive(filename:join(Path, F)) || F <- Files],
-      file:del_dir(Path)
-  end.
-
-maps_merge(Map1, Map2)->
-  maps:fold(fun(K, V2, Acc)->
-    case Map1 of
-      #{K := V1} when is_map(V1), is_map(V2)->
-        Acc#{K => maps_merge(V1, V2)};
-      _->
-        Acc#{K => V2}
-    end
-  end, Map1, Map2).
