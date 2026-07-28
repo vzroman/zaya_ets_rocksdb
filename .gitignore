@@ -1,0 +1,4 @@
+rebar.lock
+zaya_ets_rocksdb.iml
+_build/*
+.worktrees/*

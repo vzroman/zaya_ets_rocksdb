@@ -1,6 +1,7 @@
 
 -module(zaya_ets_rocksdb).
 
+-include("zaya_ets_rocksdb.hrl").
 %%=================================================================
 %%	SERVICE API
 %%=================================================================
@@ -52,9 +53,15 @@
 %%=================================================================
 -export([
   commit/3,
-  commit1/3,
-  commit2/2,
-  rollback/2
+  prepare_rollback/3,
+  is_persistent/0
+]).
+
+%%=================================================================
+%%	POOL API
+%%=================================================================
+-export([
+  pool_batch/2
 ]).
 
 %%=================================================================
@@ -64,85 +71,108 @@
   get_size/1
 ]).
 
--record(ref,{ets,rocksdb}).
+-record(ref, {
+  ets,
+  rocksdb,
+  pool
+}).
+
+-define(LOAD_BATCH_SIZE, 1000).
 
 %%=================================================================
 %%	SERVICE
 %%=================================================================
-create( Params )->
-  EtsParams = type_params(ets,Params),
-  EtsRef = zaya_ets:create( EtsParams ),
-  try
-    RocksdbRef = zaya_rocksdb:create( type_params(rocksdb, Params) ),
-    #ref{ ets = EtsRef, rocksdb = RocksdbRef }
-  catch
-    _:E->
-      catch zaya_ets:close(EtsRef),
-      catch zaya_ets:remove(EtsParams),
-      throw(E)
+create(Params)->
+  case pipe(#ref{}, [
+    fun(Ref)-> Ref#ref{ets = zaya_ets:create(type_params(ets, Params))} end,
+    fun(Ref)-> Ref#ref{rocksdb = zaya_rocksdb:create(type_params(rocksdb, Params))} end,
+    fun(#ref{ets = EtsRef, rocksdb = RocksdbRef} = Ref)->
+      Ref#ref{pool = open_pool(EtsRef, RocksdbRef, Params)}
+    end
+  ]) of
+    {ok, Ref}-> Ref;
+    {error, Error, Ref}->
+      catch close(Ref),
+      catch remove(Params),
+      throw(Error)
   end.
 
-open( Params )->
-  RocksdbRef = zaya_rocksdb:open( type_params(rocksdb, Params ) ),
-  EtsRef = zaya_ets:open( type_params(ets,Params) ),
+open(Params)->
+  case pipe(#ref{}, [
+    fun(Ref)-> Ref#ref{rocksdb = zaya_rocksdb:open(type_params(rocksdb, Params))} end,
+    fun(Ref)-> Ref#ref{ets = zaya_ets:open(type_params(ets, Params))} end,
+    fun(#ref{ets = EtsRef, rocksdb = RocksdbRef} = Ref)->
+      Ref#ref{pool = open_pool(EtsRef, RocksdbRef, Params)}
+    end,
+    fun(#ref{ets = EtsRef, rocksdb = RocksdbRef} = Ref)->
+      load_data(RocksdbRef, EtsRef),
+      Ref
+    end
+  ]) of
+    {ok, Ref}-> Ref;
+    {error, Error, Ref}->
+      catch close(Ref),
+      throw(Error)
+  end.
 
-  zaya_rocksdb:foldl(RocksdbRef,#{},fun(Rec,Acc)->
-    zaya_ets:write( EtsRef, [Rec] ),
-    Acc
-  end,[]),
+close(#ref{
+  ets = EtsRef,
+  rocksdb = RocksdbRef,
+  pool = Pool
+})->
+  catch close_pool(Pool),
+  catch zaya_ets:close(EtsRef),
+  catch zaya_rocksdb:close(RocksdbRef),
+  ok.
 
-  #ref{ ets = EtsRef, rocksdb = RocksdbRef }.
-
-close( #ref{ets = EtsRef, rocksdb = RocksdbRef} )->
-  catch zaya_ets:close( EtsRef ),
-  zaya_rocksdb:close( RocksdbRef ).
-
-remove( Params )->
-  zaya_rocksdb:remove( type_params(rocksdb, Params) ).
+remove(Params)->
+  zaya_rocksdb:remove(type_params(rocksdb, Params)),
+  ok.
 
 %%=================================================================
 %%	LOW_LEVEL
 %%=================================================================
 read(#ref{ets = EtsRef}, Keys)->
-  zaya_ets:read( EtsRef, Keys ).
+  zaya_ets:read(EtsRef, Keys).
 
-write(#ref{ets = EtsRef, rocksdb = RocksdbRef}, KVs)->
-  zaya_rocksdb:write( RocksdbRef, KVs ),
-  zaya_ets:write( EtsRef, KVs ).
+write(#ref{ets = EtsRef, rocksdb = RocksdbRef, pool = disabled}, KVs)->
+  zaya_rocksdb:write(RocksdbRef, KVs),
+  zaya_ets:write(EtsRef, KVs);
+write(#ref{pool = Pool}, KVs)->
+  zaya_pool:call(Pool, [{write, KVs}]).
 
-delete(#ref{ets = EtsRef, rocksdb = RocksdbRef}, Keys)->
-  zaya_rocksdb:delete( RocksdbRef, Keys ),
-  zaya_ets:delete( EtsRef, Keys ).
+delete(#ref{ets = EtsRef, rocksdb = RocksdbRef, pool = disabled}, Keys)->
+  zaya_rocksdb:delete(RocksdbRef, Keys),
+  zaya_ets:delete(EtsRef, Keys);
+delete(#ref{pool = Pool}, Keys)->
+  zaya_pool:call(Pool, [{delete, Keys}]).
 
 %%=================================================================
 %%	ITERATOR
 %%=================================================================
-first( #ref{ets = EtsRef} )->
-  zaya_ets:first( EtsRef ).
+first(#ref{ets = EtsRef})->
+  zaya_ets:first(EtsRef).
 
-last( #ref{ets = EtsRef} )->
-  zaya_ets:last( EtsRef ).
+last(#ref{ets = EtsRef})->
+  zaya_ets:last(EtsRef).
 
-next( #ref{ets = EtsRef}, Key )->
-  zaya_ets:next( EtsRef, Key ).
+next(#ref{ets = EtsRef}, Key)->
+  zaya_ets:next(EtsRef, Key).
 
-prev( #ref{ets = EtsRef}, Key )->
-  zaya_ets:prev( EtsRef, Key ).
+prev(#ref{ets = EtsRef}, Key)->
+  zaya_ets:prev(EtsRef, Key).
 
 %%=================================================================
 %%	HIGH-LEVEL API
 %%=================================================================
-%----------------------FIND------------------------------------------
 find(#ref{ets = EtsRef}, Query)->
-  zaya_ets:find( EtsRef, Query ).
+  zaya_ets:find(EtsRef, Query).
 
-%----------------------FOLD LEFT------------------------------------------
-foldl( #ref{ets = EtsRef}, Query, Fun, InAcc )->
-  zaya_ets:foldl( EtsRef, Query, Fun, InAcc ).
+foldl(#ref{ets = EtsRef}, Query, Fun, InAcc)->
+  zaya_ets:foldl(EtsRef, Query, Fun, InAcc).
 
-%----------------------FOLD RIGHT------------------------------------------
-foldr( #ref{ets = EtsRef}, Query, Fun, InAcc )->
-  zaya_ets:foldr( EtsRef, Query, Fun, InAcc ).
+foldr(#ref{ets = EtsRef}, Query, Fun, InAcc)->
+  zaya_ets:foldr(EtsRef, Query, Fun, InAcc).
 
 %%=================================================================
 %%	COPY
@@ -150,39 +180,102 @@ foldr( #ref{ets = EtsRef}, Query, Fun, InAcc )->
 copy(Ref, Fun, InAcc)->
   foldl(Ref, #{}, Fun, InAcc).
 
-dump_batch(Ref, KVs)->
-  write(Ref, KVs).
+dump_batch(#ref{ets = EtsRef, rocksdb = RocksdbRef}, KVs)->
+  zaya_rocksdb:write(RocksdbRef, KVs),
+  zaya_ets:write(EtsRef, KVs).
 
 %%=================================================================
 %%	TRANSACTION API
 %%=================================================================
-commit(#ref{ ets = EtsRef, rocksdb = RocksdbRef }, Write, Delete)->
-  zaya_rocksdb:commit( RocksdbRef, Write, Delete ),
-  zaya_ets:commit( EtsRef, Write, Delete ),
-  ok.
+commit(#ref{ets = EtsRef, rocksdb = RocksdbRef, pool = disabled}, Write, Delete)->
+  zaya_rocksdb:commit(RocksdbRef, Write, Delete),
+  zaya_ets:commit(EtsRef, Write, Delete),
+  ok;
+commit(#ref{pool = Pool}, Write, Delete)->
+  zaya_pool:call(Pool, [{write, Write}, {delete, Delete}]).
 
-commit1(#ref{ ets = EtsRef, rocksdb = RocksdbRef }, Write, Delete)->
-  RocksdbTRef = zaya_rocksdb:commit1( RocksdbRef, Write, Delete ),
-  EtsTRef = zaya_ets:commit1( EtsRef, Write, Delete ),
-  {EtsTRef, RocksdbTRef}.
+prepare_rollback(#ref{ets = EtsRef}, Write, Delete)->
+  zaya_ets:prepare_rollback(EtsRef, Write, Delete).
 
-commit2(#ref{ ets = EtsRef, rocksdb = RocksdbRef }, {EtsTRef, RocksdbTRef})->
-  zaya_rocksdb:commit2( RocksdbRef, RocksdbTRef ),
-  zaya_ets:commit2( EtsRef, EtsTRef ),
-  ok.
+is_persistent()->
+  true.
 
-rollback(#ref{ets = EtsRef, rocksdb = RocksdbRef }, {EtsTRef, RocksdbTRef})->
-  zaya_rocksdb:rollback( RocksdbRef, RocksdbTRef ),
-  zaya_ets:rollback(EtsRef, EtsTRef ),
+%%=================================================================
+%%	POOL API
+%%=================================================================
+pool_batch({EtsRef, RocksdbRef}, Requests)->
+  do_pool_batch(Requests, EtsRef, RocksdbRef, []).
+
+do_pool_batch([{write, KVs} | Rest], EtsRef, RocksdbRef, Writes)->
+  do_pool_batch(Rest, EtsRef, RocksdbRef, [KVs | Writes]);
+do_pool_batch(Requests, EtsRef, RocksdbRef, [_ | _] = Writes)->
+  KVs = lists:append(lists:reverse(Writes)),
+  zaya_rocksdb:write(RocksdbRef, KVs),
+  zaya_ets:write(EtsRef, KVs),
+  do_pool_batch(Requests, EtsRef, RocksdbRef, []);
+do_pool_batch([{delete, Keys} | Rest], EtsRef, RocksdbRef, Writes)->
+  zaya_rocksdb:delete(RocksdbRef, Keys),
+  zaya_ets:delete(EtsRef, Keys),
+  do_pool_batch(Rest, EtsRef, RocksdbRef, Writes);
+do_pool_batch([], _EtsRef, _RocksdbRef, [])->
   ok.
 
 %%=================================================================
 %%	INFO
 %%=================================================================
-get_size( #ref{ets = EtsRef})->
-  zaya_ets:get_size( EtsRef ).
+get_size(#ref{ets = EtsRef})->
+  zaya_ets:get_size(EtsRef).
 
-type_params( Type, Params )->
-  TypeParams = maps:with([Type],Params),
-  OtherParams = maps:without([ets,rocksdb], Params),
-  maps:merge( OtherParams, TypeParams ).
+%%=================================================================
+%%	UTILITIES
+%%=================================================================
+load_data(RocksdbRef, EtsRef)->
+  Tail = zaya_rocksdb:foldl(RocksdbRef, #{}, fun(Rec, {Batch, Count})->
+    Batch1 = [Rec | Batch],
+    case Count + 1 of
+      ?LOAD_BATCH_SIZE ->
+        zaya_ets:dump_batch(EtsRef, Batch1),
+        {[], 0};
+      Count1 ->
+        {Batch1, Count1}
+    end
+  end, {[], 0}),
+  case Tail of
+    {[_ | _] = Rest, _} -> zaya_ets:dump_batch(EtsRef, Rest);
+    _ -> ok
+  end.
+
+
+open_pool(_EtsRef, _RocksdbRef, #{pool := disabled})->
+  disabled;
+open_pool(EtsRef, RocksdbRef, Params) when is_map(Params)->
+  {ok, Pool} = zaya_pool:start_link(pool_params(EtsRef, RocksdbRef, Params)),
+  Pool.
+
+close_pool(disabled)->
+  ok;
+close_pool(Pool)->
+  zaya_pool:stop(Pool).
+
+pool_params(EtsRef, RocksdbRef, Params)->
+  maps:merge(
+    maps:get(pool, Params, #{}),
+    #{
+      ref => {EtsRef, RocksdbRef},
+      module => ?MODULE
+    }
+  ).
+
+pipe(Ref, [Step | Rest])->
+  try Step(Ref) of
+    Ref1 -> pipe(Ref1, Rest)
+  catch _:Error ->
+    {error, Error, Ref}
+  end;
+pipe(Ref, [])->
+  {ok, Ref}.
+
+type_params(Type, Params)->
+  TypeParams = maps:with([Type], Params),
+  OtherParams = maps:without([ets, rocksdb, pool], Params),
+  maps:merge(OtherParams#{pool => disabled}, TypeParams).
